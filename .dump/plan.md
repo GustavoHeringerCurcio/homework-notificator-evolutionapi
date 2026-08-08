@@ -20,21 +20,24 @@ homework-notificator-evolutionapi/
 ├── tsconfig.json
 ├── package.json
 ├── package-lock.json
+├── scripts/
+│   └── auth-setup.mjs          # Standalone auth capture (runs on host, not in Docker)
 ├── src/
 │   ├── index.ts                # Entry point: cron, health server, startup logic
 │   ├── config.ts               # Env vars, validation, defaults
 │   ├── db.ts                   # SQLite init, schema, insert, queries
 │   ├── scraper.ts              # Playwright: browser lifecycle, navigation, retries
-│   ├── parser.ts               # DOM parsing: extract date/time/title from HTML
+│   ├── parser.ts               # DOM extraction via Playwright locators (no cheerio needed)
 │   ├── notifier.ts             # Evolution API REST client, retries
 │   ├── mock.ts                 # Mock data generator (when college site is offline)
 │   ├── lock.ts                 # File-based lock to prevent concurrent scrapes
 │   ├── logger.ts               # Structured JSON logger with run_id
 │   ├── health.ts               # Express health + manual trigger endpoints
+│   ├── shutdown.ts             # Graceful SIGTERM/SIGINT handler
 │   └── types.ts                # Shared TypeScript interfaces
 ├── data/                       # Mounted volume (persistent)
 │   ├── homeworks.db            # SQLite database
-│   ├── auth.json               # Browser auth cookies/state
+│   ├── auth.json               # Browser auth cookies/state (created by auth-setup.mjs)
 │   └── snapshots/              # HTML snapshots organized by date
 │       └── 2026-08-08/
 │           └── page.html
@@ -46,11 +49,13 @@ homework-notificator-evolutionapi/
 ### 1.2 Config (.env)
 
 ```env
-# College website
-COLLEGE_URL=https://api.plataforma.grupoa.education/v2/safea-client/auth/sso/saml
+# College website (auth endpoint for login, not the homework list itself)
+COLLEGE_AUTH_URL=https://api.plataforma.grupoa.education/v2/safea-client/auth/sso/saml
+COLLEGE_HOMEWORK_URL=https://plataforma.grupoa.education/homeworks
 
 # Mock mode (true = use fake data, skip real scraping)
 USE_MOCK=true
+MOCK_SEED_DATE=2026-03-09
 
 # Scheduling
 CRON_EXPRESSION=0 10 * * *
@@ -61,13 +66,20 @@ EVOLUTION_API_URL=http://evolution-api:8080
 EVOLUTION_API_KEY=your-api-key-here
 EVOLUTION_INSTANCE=default
 
-# WhatsApp recipients (comma-separated phone numbers with country code)
+# WhatsApp recipients (comma-separated, country code + number, no "+" or spaces)
+# Valid: 5511999999999  Invalid: +55 11 99999-9999
 NOTIFY_NUMBERS=5511999999999
 
 # Scraper settings
 BROWSER_TIMEOUT_MS=30000
 RETRY_MAX=3
 RETRY_BACKOFF_MS=30000
+
+# HTML selectors (for real scraping — only needed when USE_MOCK=false)
+SELECTOR_CONTAINER=.homework-list > .item
+SELECTOR_TITLE=.title
+SELECTOR_DUE_DATE=.due-date
+SELECTOR_SENTINEL=h1
 
 # Health server
 HEALTH_PORT=3000
@@ -95,13 +107,22 @@ services:
     env_file:
       - .env
     init: true
+    depends_on:
+      evolution-api:
+        condition: service_healthy     # Wait until Evolution API is ready
     deploy:
       resources:
         limits:
           memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   evolution-api:
-    image: atendai/evolution-api:latest
+    image: atendai/evolution-api:v2.2.0      # Pinned version, not :latest
     container_name: hw-evolution-api
     restart: unless-stopped
     ports:
@@ -112,16 +133,39 @@ services:
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
       - AUTHENTICATION_TYPE=apikey
       - TZ=${TZ:-America/Sao_Paulo}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   evolution_instances:
 ```
 
-### 1.4 Dockerfile
+### 1.4 Dockerfile (Multi-stage)
+
+**Why multi-stage**: `npm ci --omit=dev` removes TypeScript — we can't run `tsc`. A build stage installs all deps + compiles; the runtime stage copies only `dist/` + production deps. This also keeps the final image smaller.
+
+**Why `PLAYWRIGHT_BROWSERS_PATH`**: Playwright installs browsers to `~/.cache/ms-playwright/` by default. A casual `rm -rf /root/.cache` would delete them. Setting `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` isolates browsers from the cache directory.
 
 ```dockerfile
+# ── Build stage: compile TypeScript ──────────────────────────
+FROM node:20-bookworm AS build
+
+WORKDIR /app
+
+COPY package.json package-lock.json tsconfig.json ./
+COPY src/ ./src/
+
+RUN npm ci && npx tsc
+
+
+# ── Runtime stage: browsers + prod deps only ─────────────────
 FROM node:20-bookworm
 
+# System libs required by Chromium
 RUN apt-get update && apt-get install -y \
     libnss3 libnspr4 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
@@ -129,18 +173,18 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
+# Install Chromium to a known path (not ~/.cache so it survives cleanup)
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx -y playwright@1.62.0 install --with-deps chromium && \
-    rm -rf /root/.cache
+    playwright@1.62.0 install-deps chromium
 
 WORKDIR /app
 
+# Copy compiled JS and production node_modules only
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY tsconfig.json ./
-COPY src/ ./src/
-
-RUN npx tsc
+COPY --from=build /app/dist ./dist
 
 CMD ["node", "dist/index.js"]
 ```
@@ -162,21 +206,43 @@ The college site (`plataforma.grupoa.education`) uses SAML SSO and is unreachabl
 
 ### 2.2 Mock Module (`src/mock.ts`)
 
+**Design constraint**: If every date is `today + N`, then every new day produces entirely new `(title_hash, due_date)` combinations — dedup _never_ fires across days. The mock must use **seeded static dates** so the same entries are returned day after day, allowing deduplication to be tested realistically.
+
 ```typescript
-// Returns fake homework entries that simulate the college site structure
-function generateMockHomeworks(): Homework[] {
-  const titles = [
-    'Lista de exercícios - Cálculo I',
-    'Projeto final - Estrutura de Dados',
-    'Relatório de laboratório - Física II',
-    'Leitura complementar - Introdução à Programação',
+// Mock uses a seed date so entries are stable across days.
+// Changing MOCK_SEED_DATE produces a new batch (simulates new semester).
+// Default seed: a past Monday so entries span a realistic week window.
+const MOCK_SEED_DATE = '2026-03-09'; // configurable via .env
+
+function generateMockHomeworks(seedDate: string): Homework[] {
+  const base = new Date(seedDate);
+
+  const entries: Homework[] = [
+    { title: 'Lista de exercícios - Cálculo I',      offsetDays: 2 },
+    { title: 'Projeto final - Estrutura de Dados',    offsetDays: 3 },
+    { title: 'Relatório de laboratório - Física II',  offsetDays: 5 },
+    { title: 'Leitura complementar - Programação',    offsetDays: 7 },
   ];
-  const today = new Date();
-  return titles.map((title, i) => ({
+
+  return entries.map(({ title, offsetDays }) => ({
     title,
-    due_date: formatDate(addDays(today, i + 1)),
+    due_date: formatDate(addDays(base, offsetDays)),
     due_time: '23:59',
   }));
+}
+// All entries always have the SAME due_date every time the function runs.
+// Day 1 trigger: 4 new, 0 dup.  Day 2 trigger: 0 new, 4 dup.
+// Only changing MOCK_SEED_DATE (new semester) produces new entries.
+```
+
+Mock also exposes a helper to generate a **fresh entry** (different seed) so you can manually test the "new homework detected" flow:
+```typescript
+function generateMockFreshEntry(): Homework {
+  return {
+    title: `Tarefa extra - ${new Date().toISOString().slice(0, 10)}`,
+    due_date: formatDate(addDays(new Date(), 2)),
+    due_time: '23:59',
+  };
 }
 ```
 
@@ -195,32 +261,40 @@ async function runScraper(config: Config): Promise<ScraperResult> {
   // 1. If USE_MOCK=true → return mock data immediately
   // 2. Acquire lock (lock.ts), abort if already running
   // 3. Launch browser (launch options: headed=false, args=['--no-sandbox'])
-  // 4. Load auth state from data/auth.json if exists
-  // 5. Navigate to COLLEGE_URL
+  // 4. Load auth state from data/auth.json if exists; if missing + USE_MOCK=false → log error, abort
+  // 5. Navigate to COLLEGE_HOMEWORK_URL
   //    - Retry up to RETRY_MAX with exponential backoff
   //    - On 5xx/timeout → retry
   //    - On 4xx/redirect to login → if auth expired → save error → abort
-  // 6. Wait for content container selector
-  //    - Validate element exists within BROWSER_TIMEOUT_MS
-  //    - If timeout → save full page HTML snapshot → return error
-  // 7. Call parser.extractHomeworks(page.content())
-  // 8. Save HTML snapshot to data/snapshots/YYYY-MM-DD/page.html
-  // 9. Close browser
-  // 10. Release lock
-  // 11. Return { success, entries, snapshotPath, durationMs }
+  // 6. Wait for a sentinel element (page title, navbar, or known container)
+  //    to confirm the page loaded correctly. If sentinel is missing → save snapshot → abort.
+  // 7. Wait for homework list container selector with page.waitForSelector()
+  //    - If timeout → save full HTML snapshot (page.content()) → return error
+  // 8. Extract entries using Playwright locators directly (NOT cheerio):
+  //    page.locator(HOMEWORK_ITEM_SELECTOR).all() → map each to { title, date, time }
+  //    This handles SPA/XHR-loaded content because we wait for the selector first.
+  // 9. Save HTML snapshot to data/snapshots/YYYY-MM-DD/page.html
+  // 10. Close browser
+  // 11. Release lock
+  // 12. Return { success, entries, snapshotPath, durationMs }
 }
 ```
 
 ### 2.4 Parser Contract (`src/parser.ts`)
 
+Uses Playwright locators directly (not cheerio on `page.content()`). This avoids the SPA problem where data loads via XHR after the initial HTML payload.
+
 ```typescript
-function extractHomeworks(html: string, selectors?: SelectorConfig): Homework[] {
-  // 1. Load HTML into cheerio (lightweight jQuery for Node.js)
-  // 2. Try primary selectors (configurable per-site)
-  // 3. For each matching DOM element:
-  //    a. Extract title → normalize (trim, collapse whitespace)
-  //    b. Extract due_date → multi-format parser → ISO 8601
-  //    c. Extract due_time → optional, HH:MM format
+// Extracts homework data from Playwright locators on the live page.
+// Configurable selectors per site, passed via SelectorConfig.
+function extractHomeworks(
+  items: Locator[],             // page.locator('.hw-item').all()
+  selectors: SelectorConfig
+): Homework[] {
+  // For each locator element:
+  //   a. item.locator(selectors.title).textContent()  → normalize
+  //   b. item.locator(selectors.date).textContent()   → parseDate()
+  //   c. item.locator(selectors.time).textContent()   → optional HH:MM
   // 4. Validate: title.length >= 3, date is valid, time is valid or null
   // 5. Return validated array
 }
@@ -232,6 +306,17 @@ function parseDate(raw: string): string | null {
 }
 ```
 
+**SelectorConfig** (in `.env` or config file):
+```typescript
+interface SelectorConfig {
+  container: string;     // e.g. '.homework-list > .item'
+  title: string;         // e.g. '.title a' or '.homework-title'
+  dueDate: string;       // e.g. '.due-date span'
+  dueTime: string;       // e.g. '.due-time' (optional)
+  sentinel: string;      // e.g. 'h1' or '.page-title' — always present if page loaded
+}
+```
+
 ### Failure modes covered in Phase 2
 
 | Failure | Handling |
@@ -239,8 +324,11 @@ function parseDate(raw: string): string | null {
 | Mock mode disabled + site unreachable | Error logged. Pipeline skips notification. Health endpoint shows `last_run_status: "error"` |
 | Browser fails to launch | Retry 3x. On final failure → log error, release lock, exit run |
 | Auth state expired (redirected to login) | Log "auth expired — needs manual re-auth". Save snapshot. Skip run |
+| Auth state file missing (never set up) | Log "Auth state not found. Run `npm run auth:setup` first." Skip run |
 | Page load timeout | Retry with increased timeout. Save partial snapshot |
-| Zero entries extracted (selectors broken?) | Save full HTML snapshot. Log WARNING. Return empty array (no crash) |
+| Sentinel element missing (page broken?) | Save full HTML snapshot. Log ERROR. Abort run — page did not load correctly |
+| Zero entries extracted (no assignments posted) | Sentinel is present → page loaded OK → log INFO "No homework entries found". Return empty array (valid). Health shows `entries_found: 0` |
+| Zero entries extracted (selectors broken) | Sentinel is present + item container matches 0 elements → log WARNING "Selectors matched nothing — site may have changed". Save snapshot. Return empty array. Health shows `parser_warning: true` |
 | HTML changes structure | Snapshots provide historical reference for debugging selector changes |
 | Lock file exists (previous run still executing) | Log "run already in progress". Skip silently. Health endpoint shows active run |
 
@@ -479,8 +567,16 @@ main():
      → Log: "Cron scheduled: {CRON_EXPRESSION} ({TZ})"
      → Log: "Next run: {next_run_time}"
 
-  9. Keep process alive
-     → (cron scheduler runs in background)
+  9. Register graceful shutdown handlers (SIGTERM, SIGINT)
+     → Release lock if held
+     → Close SQLite connection
+     → Close Playwright browser if open
+     → Stop Express server
+     → Log "Shutdown complete"
+     → process.exit(0)
+
+  10. Keep process alive
+      → (cron scheduler runs in background)
 ```
 
 ### 5.2 Run Lifecycle (`executeRun`)
@@ -545,28 +641,59 @@ The URL `https://api.plataforma.grupoa.education/v2/safea-client/auth/sso/saml` 
 
 ### 6.2 Auth Strategy: Cookie Persistence
 
-**One-time setup** (manual, outside Docker):
+**Problem**: The auth setup requires a headed browser (user must visually click through the SAML login). Docker containers don't have a display. Running a headed browser inside Docker requires VNC/noVNC, adding significant complexity.
+
+**Solution**: Auth setup runs on the **host machine** (Windows), not in Docker. A standalone script handles login, and the resulting `auth.json` is saved to the `./data/` volume shared with the container.
+
+**One-time setup** (outside Docker):
 ```bash
-# Run a helper script that launches Playwright with headed browser
-# User logs in manually, cookies are saved to data/auth.json
-npm run auth:setup
+# 1. Install Node.js + Playwright locally (one-time)
+npm install playwright
+
+# 2. Run the auth capture script (opens visible browser)
+node scripts/auth-setup.mjs
+
+# 3. Log in manually in the browser window that opens
+# 4. Script auto-detects login completion and saves data/auth.json
+# 5. docker compose up → scraper picks up auth.json via the mounted volume
 ```
 
-**Auth setup script** (`src/setup-auth.ts`):
-```typescript
+**Auth setup script** (`scripts/auth-setup.mjs` — self-contained, no TypeScript compilation needed):
+```javascript
+// Standalone ESM script - runs directly with `node` on the host machine.
+// No project dependencies needed except playwright.
+import { chromium } from 'playwright';
+
+// Config hardcoded or read from .env via process.env
+const AUTH_URL = process.env.COLLEGE_AUTH_URL;
+const HOMEWORK_URL = process.env.COLLEGE_HOMEWORK_URL;
+
 async function setupAuth() {
-  // 1. Launch headed Chromium (visible browser window for user interaction)
-  // 2. Navigate to COLLEGE_URL
-  // 3. Wait for user to complete login (detect redirect back to dashboard)
-  // 4. Save storageState to data/auth.json (cookies + localStorage)
-  // 5. Log "Auth saved. You can now run the scraper."
+  const browser = await chromium.launch({ headless: false });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  await page.goto(AUTH_URL);
+
+  // Wait for user to complete SAML login (detect redirect to dashboard)
+  console.log('Waiting for login... (complete the login in the browser window)');
+  await page.waitForURL(url => url.startsWith(HOMEWORK_URL), { timeout: 300_000 });
+
+  // Save cookies + localStorage to shared volume
+  await context.storageState({ path: 'data/auth.json' });
+  console.log('✅ Auth saved to data/auth.json');
+
+  await browser.close();
 }
+
+setupAuth().catch(err => { console.error(err); process.exit(1); });
 ```
 
-**Reusing auth** (in scraper):
+**Reusing auth in the Docker container** (inside scraper.ts):
 ```typescript
+// Load auth state from the mounted volume
 const context = await browser.newContext({
-  storageState: 'data/auth.json',  // Load saved cookies
+  storageState: path.join(config.dataDir, 'auth.json'),
 });
 ```
 
@@ -596,6 +723,10 @@ Since the site is frequently offline (vacations, maintenance), mock mode is a pe
   "uptime_seconds": 86400,
   "mode": "MOCK",
   "dry_run": false,
+  "auth": {
+    "valid": true,
+    "file_exists": true
+  },
   "database": {
     "ok": true,
     "total_homeworks": 42,
@@ -618,7 +749,8 @@ Since the site is frequently offline (vacations, maintenance), mock mode is a pe
     "entries_found": 5,
     "entries_new": 2,
     "entries_dup": 3,
-    "duration_ms": 7000
+    "duration_ms": 7000,
+    "parser_warning": false
   },
   "lock": {
     "active": false
@@ -711,7 +843,6 @@ prod:
   playwright                     # Browser automation (Chromium)
   better-sqlite3                 # SQLite driver
   node-cron                      # Cron scheduler
-  cheerio                        # HTML parsing (jQuery for Node.js)
   express                        # Health HTTP server
   uuid                           # Run ID generation
   dotenv                         # .env loading
