@@ -71,6 +71,7 @@ EVOLUTION_INSTANCE=default
 NOTIFY_NUMBERS=5511999999999
 
 # Scraper settings
+PLAYWRIGHT_VERSION=1.62.0
 BROWSER_TIMEOUT_MS=30000
 RETRY_MAX=3
 RETRY_BACKOFF_MS=30000
@@ -165,18 +166,18 @@ RUN npm ci && npx tsc
 # ── Runtime stage: browsers + prod deps only ─────────────────
 FROM node:20-bookworm
 
-# System libs required by Chromium
+# System libs required by Chromium + curl for healthcheck
 RUN apt-get update && apt-get install -y \
     libnss3 libnspr4 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
     libpango-1.0-0 libcairo2 libasound2t64 \
+    curl \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Chromium to a known path (not ~/.cache so it survives cleanup)
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN npx -y playwright@1.62.0 install --with-deps chromium && \
-    playwright@1.62.0 install-deps chromium
+RUN npx -y playwright@1.62.0 install --with-deps chromium
 
 WORKDIR /app
 
@@ -187,6 +188,38 @@ RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 
 CMD ["node", "dist/index.js"]
+```
+
+### 1.5 TypeScript Config (`tsconfig.json`)
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src"]
+}
+```
+
+### 1.6 .gitignore
+
+```
+node_modules/
+dist/
+.env
+data/*.db
+data/auth.json
+data/snapshots/
 ```
 
 ### Expected outcome
@@ -535,6 +568,11 @@ async function checkEvolutionApi(config: Config): Promise<boolean> {
 main():
   1. Load and validate config (config.ts)
      → Error if required env vars missing → exit(1)
+     → If USE_MOCK=false, validate COLLEGE_HOMEWORK_URL is not a placeholder + is a valid URL
+       → If invalid → log WARNING, continue with mock force-enabled
+     → Validate NOTIFY_NUMBERS format: strip +, spaces, dashes; must match /^\d{10,15}$/ per number
+     → Validate EVOLUTION_API_KEY is non-empty
+     → Validate CRON_EXPRESSION is parseable by node-cron
 
   2. Initialize logger with first run_id
      → Log: "Starting homework-notificator v1.0.0"
@@ -549,8 +587,12 @@ main():
      → Listen on HEALTH_PORT (3000)
      → Endpoints: GET /health, GET /trigger
 
-  5. Check Evolution API connectivity
-     → Log: "Evolution API: {connected ? 'OK' : 'UNREACHABLE'}"
+  5. Check Evolution API connectivity (with retry)
+     → Retry up to 10 times with 6s backoff (total ~60s max)
+     → If connected → Log: "Evolution API: OK"
+     → If still unreachable after retries → Log: "Evolution API: UNREACHABLE after 10 retries"
+     → Health endpoint shows actual connectivity state
+     → Do NOT block startup — the cron still runs, pending notifications retry later
 
   6. Check for missed run
      → Query scrape_runs for last success
@@ -675,9 +717,12 @@ async function setupAuth() {
 
   await page.goto(AUTH_URL);
 
-  // Wait for user to complete SAML login (detect redirect to dashboard)
+  // Wait for user to complete SAML login.
+  // Detect completion by leaving auth/SAML pages (works regardless of final landing URL).
   console.log('Waiting for login... (complete the login in the browser window)');
-  await page.waitForURL(url => url.startsWith(HOMEWORK_URL), { timeout: 300_000 });
+  await page.waitForURL(url => {
+    return !url.includes('/auth/') && !url.includes('/sso/') && !url.includes('/saml');
+  }, { timeout: 300_000 });
 
   // Save cookies + localStorage to shared volume
   await context.storageState({ path: 'data/auth.json' });
