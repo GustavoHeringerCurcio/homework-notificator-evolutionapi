@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  scraper:
+    build: .
+    container_name: hw-scraper
+    restart: unless-stopped
+    ports:
+      - "${HEALTH_PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=${TZ:-America/Sao_Paulo}
+    env_file:
+      - .env
+    init: true
+    depends_on:
+      evolution-api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  evolution-api:
+    image: atendai/evolution-api:v2.2.0
+    container_name: hw-evolution-api
+    restart: unless-stopped
+    ports:
+      - "${EVOLUTION_PORT:-8080}:8080"
+    volumes:
+      - evolution_instances:/evolution/instances
+    environment:
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - AUTHENTICATION_TYPE=apikey
+      - TZ=${TZ:-America/Sao_Paulo}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  evolution_instances:
